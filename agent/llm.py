@@ -67,9 +67,10 @@ def ask_json(system: str, prompt: str, *, temperature: float = 0.2, tag: str = "
         if data is None:
             raise LLMError(f"The model did not return valid JSON for step '{tag}'.")
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+    if data:  # an empty reply is never cached, so the next run asks again
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
     return data
 
 

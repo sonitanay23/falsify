@@ -290,13 +290,36 @@ in at least two queries per angle so the research is current. Return JSON:
             kws += a["keywords"]
         return list(dict.fromkeys(kws))
 
+    def own_site(self, url: str, about: str = "company") -> bool:
+        """Is this URL on the company's (or a peer's) own website? Handles hdfcbank.com and hdfc.bank.in alike."""
+        if about == "company":
+            names, sites = self.aliases, [self.profile.get("website_domain") or ""]
+        else:
+            peer = next((p for p in self.peers if p["name"] == about), None)
+            if not peer:
+                return False
+            names, sites = [peer["name"]] + _list(peer.get("aliases")), []
+        host = web.domain(url)
+        if any(sd and (host == web.domain("https://" + sd) or host.endswith("." + web.domain("https://" + sd))) for sd in sites):
+            return True
+        generic = {"com", "in", "co", "org", "net", "bank", "www", "ir", "investor", "investors", "cms", "assets", "cdn",
+                   "files", "images", "static", "docs", "web"}
+        labels = [l for l in host.split(".") if l and l not in generic]
+        candidates = set(labels) | {"".join(labels)}
+        cores = {_core(n) for n in names if len(_core(n)) >= 3}
+        cores |= {c[:-4] for c in cores if c.endswith("bank") and len(c) >= 7}  # "icicibank" -> icici.bank.in
+        return bool(candidates & cores)
+
     def add_doc(self, doc: dict, about: str, origin: str) -> str:
         with self._lock:
             self._doc_n += 1
             did = f"D{self._doc_n}"
             doc = dict(doc)
-            doc.update({"id": did, "about": about, "origin": origin,
-                        "source_type": web.source_type(doc["url"], [self.profile.get("website_domain") or ""])})
+            st = web.source_type(doc["url"], [self.profile.get("website_domain") or ""])
+            if st in ("other", "news") and (self.own_site(doc["url"]) or
+                                            (origin == "peer" and self.own_site(doc["url"], about))):
+                st = "company"
+            doc.update({"id": did, "about": about, "origin": origin, "source_type": st})
             self.docs[did] = doc
             return did
 
@@ -373,6 +396,13 @@ in at least two queries per angle so the research is current. Return JSON:
         # peers: one comparable, recent document each
         for peer in self.peers[: config.PROFILE["peer_docs"]]:
             results = web.search(f"{peer['name']} {self.when['latest_quarter']} investor presentation results")
+            peer_names = [peer["name"]] + _list(peer.get("aliases"))
+
+            def about_peer(r, names=peer_names, pname=peer["name"]):
+                blob = f"{r.get('title', '')} {r.get('snippet', '')} {r.get('url', '')}".lower()
+                flat = re.sub(r"[^a-z0-9]", "", blob)
+                return self.own_site(r["url"], pname) or any(len(_core(n)) >= 3 and _core(n) in flat for n in names)
+            results = [r for r in results if about_peer(r)]
             results.sort(key=lambda r: (".pdf" not in r["url"].lower(), not recent(r)))
             got = False
             for r in results[:5]:
@@ -614,6 +644,10 @@ Return JSON:
   "non_obvious_because": "why a summary or dashboard would miss it",
   "kill_criteria": ["evidence that would prove this wrong"]}}]}}"""
         out = ask_json(self.analyst, prompt, temperature=0.4, tag="hypothesize")
+        if not (isinstance(out, dict) and _list(out.get("candidates"))):
+            log.warn("The hypothesis step came back empty; asking again")
+            out = ask_json(self.analyst, prompt + "\n\nYour previous reply was empty. Return at least one candidate "
+                           "in the JSON format above.", temperature=0.5, tag="hypothesize retry")
         ids = {c["id"] for c in verified}
         self.candidates = []
         for i, h in enumerate(out.get("candidates", []) if isinstance(out, dict) else []):
@@ -766,7 +800,7 @@ Return JSON: {{"verdict": "survives|downgraded|killed",
         extra = [c for c in self.claims if c["verified"] and c["metric"] in metrics
                  and c["id"] not in sup_ids and c["id"] not in counter_ids and isinstance(c.get("value"), (int, float))]
         extra_txt = "\n".join(self.claim_line(c) for c in extra[:40]) or "(none)"
-        out = ask_json(self.analyst, f"""Write up this finding about {self.profile.get('company_name', self.company)}.
+        write_prompt = f"""Write up this finding about {self.profile.get('company_name', self.company)}.
 
 Hypothesis: {h['hypothesis']}
 Mechanism: {h.get('mechanism', '')}
@@ -808,8 +842,29 @@ Return JSON:
   "chart_series": [{{"entity": "company or peer name", "metric": "metric name"}}],
   "counterargument": "the strongest alternative explanation or contradictory evidence",
   "falsification_condition": "",
-  "strength_reasoning": "why the evidence is {h['strength']}"}}""", tag="write")
+  "strength_reasoning": "why the evidence is {h['strength']}"}}"""
+        out = ask_json(self.analyst, write_prompt, tag="write")
         out = out if isinstance(out, dict) else {}
+        if not str(out.get("discovery") or "").strip():
+            log.warn("The write-up came back empty; asking again")
+            out = ask_json(self.analyst, write_prompt + "\n\nYour previous reply was empty or incomplete. Fill in EVERY "
+                           "field above, starting with \"discovery\".", temperature=0.35, tag="write retry")
+            out = out if isinstance(out, dict) else {}
+        judge = h.get("judge", {})
+        if not str(out.get("discovery") or "").strip():  # never show blanks: fall back to what was tested
+            log.warn("Write-up still incomplete; using the tested hypothesis and the red team's own words")
+        out.setdefault("discovery", "")
+        out["discovery"] = out["discovery"] or h["hypothesis"]
+        if not _list(out.get("why_it_matters")):
+            out["why_it_matters"] = [x for x in [h.get("non_obvious_because"), h.get("mechanism"), judge.get("reason")] if x]
+        out["counterargument"] = out.get("counterargument") or judge.get("strongest_counterargument", "")
+        if not str(out.get("falsification_condition") or "").strip():
+            kc = _list(h.get("kill_criteria"))
+            out["falsification_condition"] = (f"Reconsider if, in the quarters after {self.when['latest_quarter']}: {kc[0]}"
+                                              if kc else "")
+        if not out.get("timeline"):  # build one from the dated supporting claims
+            out["timeline"] = [{"period": byid[i].get("period"), "event": byid[i]["statement"], "claim_ids": [i]}
+                               for i in sup_ids if byid[i].get("period")]
 
         shown = list(sup_ids) + list(counter_ids) + [c["id"] for c in extra[:40]]  # every claim the model was shown
         # numbers are computed here, not by the model
